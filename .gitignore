@@ -1,0 +1,18 @@
+# Vivado
+*.jou
+*.log
+*.str
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.srcs/*/new/
+
+# Simulation output
+*.vcd
+*.vvp
+
+# OS
+.DS_Store
