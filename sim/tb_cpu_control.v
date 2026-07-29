@@ -1,5 +1,6 @@
 // tb_cpu_control.v
-// Icarus Verilog testbench for cpu_control (Block 2 + Block 1 + Block 0 LD imm8).
+// Icarus Verilog testbench for cpu_control (Blocks 2, 1, 0-LD-imm8, now with
+// memory writes for LD (HL),r8 and LD (HL),d8).
 
 `timescale 1ns/1ps
 
@@ -10,6 +11,8 @@ module tb_cpu_control;
 
     wire [15:0] mem_addr;
     reg  [7:0]  mem_data_in;
+    wire        mem_write_en;
+    wire [7:0]  mem_write_data;
     wire [15:0] pc;
     wire [7:0]  ir;
     wire        unimplemented;
@@ -22,11 +25,20 @@ module tb_cpu_control;
     cpu_control dut (
         .clk(clk), .rst(rst),
         .mem_addr(mem_addr), .mem_data_in(mem_data_in),
+        .mem_write_en(mem_write_en), .mem_write_data(mem_write_data),
         .pc(pc), .ir(ir), .unimplemented(unimplemented), .halted(halted)
     );
 
+    // Combinational read
     always @(*) begin
         mem_data_in = mem[mem_addr];
+    end
+
+    // Synchronous write -- same convention as register_file's own write port
+    always @(posedge clk) begin
+        if (mem_write_en) begin
+            mem[mem_addr] <= mem_write_data;
+        end
     end
 
     always #5 clk = ~clk;
@@ -55,6 +67,32 @@ module tb_cpu_control;
         end
     endtask
 
+    // LD (HL),d8 needs an extra cycle (S_MEM_WRITE) beyond the usual 4,
+    // so it gets its own wait count rather than reusing run_and_check.
+    task run_and_check_5cyc(
+        input [7:0] exp_a, input exp_z, input exp_n, input exp_h, input exp_c,
+        input exp_unimpl, input [16*8-1:0] name
+    );
+        begin
+            repeat (5) @(posedge clk);
+            #1;
+            if (dut.rf.a_reg !== exp_a) begin
+                $display("FAIL: %0s -- A expected %02h got %02h", name, exp_a, dut.rf.a_reg);
+                errors = errors + 1;
+            end
+            if (dut.rf.f_reg !== {exp_z, exp_n, exp_h, exp_c}) begin
+                $display("FAIL: %0s -- flags expected z=%b n=%b h=%b c=%b got %04b",
+                          name, exp_z, exp_n, exp_h, exp_c, dut.rf.f_reg);
+                errors = errors + 1;
+            end
+            if (unimplemented !== exp_unimpl) begin
+                $display("FAIL: %0s -- unimplemented expected %b got %b",
+                          name, exp_unimpl, unimplemented);
+                errors = errors + 1;
+            end
+        end
+    endtask
+
     initial begin
         $dumpfile("cpu_control.vcd");
         $dumpvars(0, tb_cpu_control);
@@ -65,13 +103,13 @@ module tb_cpu_control;
         mem[3]  = 8'hBF; // CP A,A
         mem[4]  = 8'h41; // LD B,C
         mem[5]  = 8'h7E; // LD A,(HL)
-        mem[6]  = 8'h70; // LD (HL),B  -- unsupported
+        mem[6]  = 8'h70; // LD (HL),B  -- NOW SUPPORTED (writes memory)
         mem[7]  = 8'h06; // LD B,d8
         mem[8]  = 8'h42; //   immediate: 0x42
         mem[9]  = 8'h3E; // LD A,d8
         mem[10] = 8'h99; //   immediate: 0x99
-        mem[11] = 8'h36; // LD (HL),d8 -- unsupported, but pc must still skip mem[12]
-        mem[12] = 8'h55; //   immediate (unused -- write is unsupported)
+        mem[11] = 8'h36; // LD (HL),d8 -- NOW SUPPORTED (writes memory)
+        mem[12] = 8'h55; //   immediate: 0x55
         mem[13] = 8'h76; // HALT
         mem[14] = 8'h00; // should never actually be fetched
 
@@ -99,31 +137,31 @@ module tb_cpu_control;
         end
 
         run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "LD A,(HL)");
-        run_and_check(8'h07, 1, 1, 0, 0, 1'b1, "LD (HL),B (unsupported)");
 
-        // LD B,d8: B should take the immediate byte; A/flags/unimplemented unaffected
+        // LD (HL),B: NOW writes memory. B(=0x03) should land at mem[0x0100].
+        run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "LD (HL),B");
+        if (mem[16'h0100] !== 8'h03) begin
+            $display("FAIL: LD (HL),B -- mem[0x0100] expected 03 got %02h", mem[16'h0100]);
+            errors = errors + 1;
+        end
+
         run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "LD B,d8");
         if (dut.rf.b_reg !== 8'h42) begin
             $display("FAIL: LD B,d8 -- B expected 42 got %02h", dut.rf.b_reg);
             errors = errors + 1;
         end
-        if (pc !== 16'd9) begin
-            $display("FAIL: LD B,d8 -- pc expected 9 (skipped opcode+immediate) got %0d", pc);
-            errors = errors + 1;
-        end
 
-        // LD A,d8: A takes the immediate byte directly; flags still untouched
         run_and_check(8'h99, 1, 1, 0, 0, 1'b0, "LD A,d8");
-        if (pc !== 16'd11) begin
-            $display("FAIL: LD A,d8 -- pc expected 11 got %0d", pc);
+
+        // LD (HL),d8: NOW writes memory, and takes 5 cycles (extra
+        // S_MEM_WRITE state), not 4.
+        run_and_check_5cyc(8'h99, 1, 1, 0, 0, 1'b0, "LD (HL),d8");
+        if (mem[16'h0100] !== 8'h55) begin
+            $display("FAIL: LD (HL),d8 -- mem[0x0100] expected 55 got %02h", mem[16'h0100]);
             errors = errors + 1;
         end
-
-        // LD (HL),d8: unsupported -- A/flags/B unchanged, unimplemented fires,
-        // but pc must still have skipped both the opcode AND its immediate byte
-        run_and_check(8'h99, 1, 1, 0, 0, 1'b1, "LD (HL),d8 (unsupported)");
-        if (pc !== 16'd13) begin
-            $display("FAIL: LD (HL),d8 -- pc expected 13 (must skip immediate even though unsupported) got %0d", pc);
+        if (dut.rf.b_reg !== 8'h42) begin
+            $display("FAIL: LD (HL),d8 -- B should be untouched, expected 42 got %02h", dut.rf.b_reg);
             errors = errors + 1;
         end
 
