@@ -2,19 +2,21 @@
 // SM83 control FSM -- decodes and executes:
 //   Block 2: ALU A,r8       Block 1: LD r8,r8' (incl. LD (HL),r8)
 //   Block 0: LD r8,imm8 (incl. LD (HL),d8)
+//   Plus unconditional control flow: JR imm8, JP imm16, JP (HL)
 //
-// With the memory-write port added, Block 1 and Block 0's LD-immediate
-// are now FULLY supported -- no more carved-out cases in either.
+// Conditional jumps (JR cc,r8 / JP cc,a16) are NOT yet supported --
+// deliberately scoped out, since unconditional jumps alone already
+// introduce the first real break from "pc_reg only ever increments,"
+// which every instruction before this assumed.
 //
-// LD (HL),d8 needs two separate memory operations: read the immediate
-// byte (from pc_reg), then write it somewhere else entirely (hl_pair).
-// The existing 4-state pipeline only budgets one extra memory cycle
-// (MEM_READ) ahead of EXECUTE, which isn't enough room for both a read
-// and a write to different addresses -- so this case alone detours
-// through a 5th state, MEM_WRITE, after EXECUTE. LD (HL),r8 doesn't need
-// this, since it has no immediate byte to fetch -- the value to write
-// (a register's current contents) is available combinationally with no
-// extra latency, so it completes within the normal 4 cycles.
+// JP imm16 needs a genuinely new capability: TWO separate immediate
+// bytes (low, then high), read from two different memory cycles, before
+// the jump target is even known. The existing pipeline only budgets one
+// extra read cycle (MEM_READ) ahead of EXECUTE -- not enough for a
+// second byte -- so this instruction alone detours through a new state,
+// MEM_READ2. JR only needs one immediate byte (like LD r,imm8), so it
+// fits the existing 4-cycle pattern. JP (HL) needs no immediate bytes
+// at all -- it just redirects pc_reg to hl_pair directly in EXECUTE.
 //
 // HALT (opcode 0x76) is recognized and handled (the FSM parks in S_HALT
 // and stays there), but since there's no interrupt controller yet,
@@ -51,22 +53,22 @@ module cpu_control (
     localparam S_FETCH     = 3'b000,
                S_DECODE    = 3'b001,
                S_MEM_READ  = 3'b010,
-               S_EXECUTE   = 3'b011,
-               S_MEM_WRITE = 3'b100,
-               S_HALT      = 3'b101;
+               S_MEM_READ2 = 3'b011,
+               S_EXECUTE   = 3'b100,
+               S_MEM_WRITE = 3'b101,
+               S_HALT      = 3'b110;
 
     reg [2:0]  state;
     reg [15:0] pc_reg;
     reg [7:0]  ir_reg;
-    reg [7:0]  imm8_reg; // latches the fetched immediate byte for LD (HL),d8's write
+    reg [7:0]  imm8_reg;  // latches the fetched immediate byte for LD (HL),d8's write
+    reg [7:0]  jp_low_reg; // latches JP imm16's low byte between MEM_READ2 and EXECUTE
 
     assign pc     = pc_reg;
     assign ir     = ir_reg;
     assign halted = (state == S_HALT);
 
     // ---- Decode ----
-    // Same 3-bit fields, reused with different meanings depending on which
-    // block the top 2 bits point to -- a recurring SM83 pattern.
     wire [2:0] alu_op       = ir_reg[5:3];  // Block 2: which ALU operation
     wire [2:0] dest_code    = ir_reg[5:3];  // Block 1: destination register
     wire [2:0] ld_imm8_dest = ir_reg[5:3];  // Block 0 LD r,imm8: destination register
@@ -77,64 +79,57 @@ module cpu_control (
     wire is_block2 = (ir_reg[7:6] == 2'b10);
     wire is_halt   = (ir_reg == 8'h76);
 
+    // Fixed single-byte opcodes -- exact matches, same convention as HALT,
+    // since none of these are defined by a bit-field pattern the way
+    // blocks are.
+    wire is_jr      = (ir_reg == 8'h18); // JR imm8 (unconditional)
+    wire is_jp_imm16 = (ir_reg == 8'hC3); // JP imm16 (unconditional)
+    wire is_jp_hl    = (ir_reg == 8'hE9); // JP (HL)
+
     wire is_mem_operand = (reg_code  == 3'b110); // source is (HL)
     wire is_dest_mem     = (dest_code == 3'b110); // Block 1 dest is (HL)
 
     wire is_ld_imm8          = is_block0 && (reg_code == 3'b110); // pattern 00 rrr 110
     wire is_ld_imm8_dest_mem = is_ld_imm8 && (ld_imm8_dest == 3'b110); // LD (HL),d8
 
-    // Block 1, split by which kind of write it needs.
     wire is_block1_regwrite = is_block1 && !is_halt && !is_dest_mem; // LD r,r' / LD r,(HL)
-    wire is_block1_memwrite = is_block1 && !is_halt && is_dest_mem;  // LD (HL),r8 -- NEW
-    wire is_supported_block1 = is_block1_regwrite || is_block1_memwrite; // all of Block 1 now
+    wire is_block1_memwrite = is_block1 && !is_halt && is_dest_mem;  // LD (HL),r8
+    wire is_supported_block1 = is_block1_regwrite || is_block1_memwrite;
 
-    // Block 0 LD imm8, split the same way.
     wire is_ld_imm8_regwrite = is_ld_imm8 && !is_ld_imm8_dest_mem; // LD r,d8
-    wire is_ld_imm8_memwrite = is_ld_imm8_dest_mem;                 // LD (HL),d8 -- NEW
-    wire is_supported_ld_imm8 = is_ld_imm8_regwrite || is_ld_imm8_memwrite; // all of it now
+    wire is_ld_imm8_memwrite = is_ld_imm8_dest_mem;                 // LD (HL),d8
+    wire is_supported_ld_imm8 = is_ld_imm8_regwrite || is_ld_imm8_memwrite;
 
     wire need_mem_read = (is_block2 || is_block1) && is_mem_operand && !is_halt;
+
+    // Sign-extends JR's 8-bit relative offset to 16 bits so it can be
+    // added directly to pc_reg. Concatenating 8 copies of the sign bit is
+    // the standard Verilog idiom for this -- {8{bit}} repeats a single
+    // bit 8 times, giving the correct two's-complement 16-bit value.
+    wire [15:0] jr_offset_ext = {{8{mem_data_in[7]}}, mem_data_in};
 
     wire [7:0]  reg_a_data;
     wire [7:0]  reg_b_data;
     wire [3:0]  flags_out;
     wire [15:0] hl_pair;
 
-    // When the operand is (HL), mem_addr was pointed at hl_pair during
-    // MEM_READ, so mem_data_in already reflects that byte here -- no
-    // extra latching register needed for reads. LD (HL),d8's write value
-    // DOES need latching (imm8_reg above), since mem_addr moves on to
-    // hl_pair before the write actually happens.
     wire [7:0] resolved_b = is_mem_operand ? mem_data_in : reg_b_data;
 
     wire [7:0] alu_result;
     wire       alu_z, alu_n, alu_h, alu_c;
 
-    wire do_writeback   = is_block2 && (alu_op != ALU_CP); // CP sets flags only
-    wire do_flags_write = is_block2;                        // LD never touches flags
+    wire do_writeback   = is_block2 && (alu_op != ALU_CP);
+    wire do_flags_write = is_block2;
 
-    // Register-file write path -- only the REGWRITE variants apply here;
-    // the MEMWRITE variants (LD (HL),r8 / LD (HL),d8) write memory instead,
-    // handled separately below via mem_write_en/mem_write_data.
     wire [2:0] write_sel_mux  = is_ld_imm8_regwrite ? ld_imm8_dest :
                                 is_block1_regwrite  ? dest_code   : SEL_A;
     wire [7:0] write_data_mux = is_ld_imm8_regwrite ? mem_data_in :
                                 is_block1_regwrite   ? resolved_b : alu_result;
 
-    // MUST be combinational, not registered -- register_file's own
-    // posedge-triggered write needs write_en high for the entire cycle
-    // the write data is valid, not a pulse that arrives one edge late.
     wire in_execute  = (state == S_EXECUTE);
     wire rf_write_en = in_execute && (do_writeback || is_block1_regwrite || is_ld_imm8_regwrite);
     wire flags_write_en_w = in_execute && do_flags_write;
 
-    // Memory-write path. Two different reasons to write, active at two
-    // different states:
-    //   - LD (HL),r8 writes DURING S_EXECUTE (no immediate byte to wait on;
-    //     the register value and hl_pair address are both already valid).
-    //   - LD (HL),d8 writes DURING S_MEM_WRITE (needs the extra cycle,
-    //     since mem_addr was busy fetching the immediate byte during the
-    //     cycle before EXECUTE).
     wire mem_write_en_block1 = in_execute && is_block1_memwrite;
     wire mem_write_en_imm8   = (state == S_MEM_WRITE);
     assign mem_write_en   = mem_write_en_block1 || mem_write_en_imm8;
@@ -165,6 +160,7 @@ module cpu_control (
             ir_reg        <= 8'h00;
             mem_addr      <= 16'h0000;
             imm8_reg      <= 8'h00;
+            jp_low_reg    <= 8'h00;
             unimplemented <= 1'b0;
         end else begin
             unimplemented <= 1'b0; // default; only pulses in EXECUTE below
@@ -176,41 +172,62 @@ module cpu_control (
                 end
 
                 S_DECODE: begin
-                    ir_reg <= mem_data_in; // valid now -- mem_addr was set last cycle
+                    ir_reg <= mem_data_in;
                     pc_reg <= pc_reg + 1'b1;
                     state  <= S_MEM_READ;
                 end
 
                 S_MEM_READ: begin
-                    // ir_reg is valid now, so all decode wires above are
-                    // trustworthy here.
                     if (need_mem_read) begin
-                        mem_addr <= hl_pair;       // Block 1/2 (HL) source read
+                        mem_addr <= hl_pair;
                     end else if (is_ld_imm8) begin
-                        mem_addr <= pc_reg;         // fetch the immediate byte
+                        mem_addr <= pc_reg;
                     end else if (is_block1_memwrite) begin
-                        mem_addr <= hl_pair;        // prepare write address one cycle ahead
+                        mem_addr <= hl_pair;
+                    end else if (is_jr) begin
+                        mem_addr <= pc_reg;       // fetch the relative offset byte
+                    end else if (is_jp_imm16) begin
+                        mem_addr <= pc_reg;       // fetch the low byte of the target address
                     end
-                    state <= S_EXECUTE;
+                    // is_jp_hl needs no redirect at all -- no immediate bytes involved
+                    state <= is_jp_imm16 ? S_MEM_READ2 : S_EXECUTE;
+                end
+
+                S_MEM_READ2: begin
+                    // Only ever entered for JP imm16. mem_data_in now holds
+                    // the low byte (mem_addr was set to pc_reg last cycle).
+                    jp_low_reg <= mem_data_in;
+                    mem_addr   <= pc_reg + 1'b1; // point at the high byte next
+                    pc_reg     <= pc_reg + 1'b1; // consume the low byte
+                    state      <= S_EXECUTE;
                 end
 
                 S_EXECUTE: begin
                     if (is_ld_imm8) begin
-                        // Consume the immediate byte from the instruction
-                        // stream either way -- pc must skip past it.
                         pc_reg <= pc_reg + 1'b1;
+                    end else if (is_jr) begin
+                        // Consume the offset byte AND apply the signed jump
+                        // in one step: pc_reg right now already points just
+                        // past the offset byte's address, matching real
+                        // hardware's "relative to the byte after this
+                        // instruction" semantics.
+                        pc_reg <= pc_reg + 1'b1 + jr_offset_ext;
+                    end else if (is_jp_imm16) begin
+                        // High byte just arrived on mem_data_in; low byte
+                        // was latched last cycle. Assemble the full target.
+                        pc_reg <= {mem_data_in, jp_low_reg};
+                    end else if (is_jp_hl) begin
+                        pc_reg <= hl_pair;
                     end
 
                     if (is_ld_imm8_memwrite) begin
-                        // Capture the immediate byte NOW, while mem_addr
-                        // still points at it (from MEM_READ) -- next cycle
-                        // mem_addr moves to hl_pair for the actual write.
                         imm8_reg <= mem_data_in;
                         mem_addr <= hl_pair;
                     end
 
                     unimplemented <= !is_block2 && !is_supported_block1 &&
-                                      !is_halt && !is_supported_ld_imm8;
+                                      !is_halt && !is_supported_ld_imm8 &&
+                                      !is_jr && !is_jp_imm16 && !is_jp_hl;
 
                     if (is_ld_imm8_memwrite) begin
                         state <= S_MEM_WRITE;
@@ -220,15 +237,10 @@ module cpu_control (
                 end
 
                 S_MEM_WRITE: begin
-                    // mem_addr already = hl_pair (set last cycle in EXECUTE);
-                    // mem_write_en/mem_write_data are combinational and
-                    // already valid throughout this whole state.
                     state <= S_FETCH;
                 end
 
                 S_HALT: begin
-                    // Parked here until a future phase adds interrupt-driven
-                    // wake-up. Deliberately doesn't advance pc or re-fetch.
                     state <= S_HALT;
                 end
 
