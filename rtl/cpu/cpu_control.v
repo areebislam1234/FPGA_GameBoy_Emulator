@@ -1,14 +1,20 @@
 // cpu_control.v
-// SM83 control FSM -- decodes and executes Block 2 (ALU A,r8) and
-// Block 1 (LD r8,r8'), including the (HL) memory-operand cases.
+// SM83 control FSM -- decodes and executes:
+//   Block 2: ALU A,r8            Block 1: LD r8,r8'            Block 0: LD r8,imm8
+// including the (HL) memory-operand cases.
 //
-// Deliberately NOT yet supported: LD (HL),r8 -- writing a register INTO
-// memory needs a memory-write port this module doesn't have yet. That
-// specific case is explicitly flagged via `unimplemented` rather than
-// silently doing nothing. HALT (opcode 0x76) is recognized and handled
-// (the FSM parks in S_HALT and stays there), but since there's no
-// interrupt controller yet, nothing currently wakes it back up --
-// that's a known gap for a later phase, not a bug.
+// Deliberately NOT yet supported: LD (HL),r8 and LD (HL),d8 -- writing a
+// value INTO memory needs a memory-write port this module doesn't have
+// yet. Both are explicitly flagged via `unimplemented` rather than
+// silently doing nothing -- though the program counter still correctly
+// skips past LD (HL),d8's immediate byte even though the write itself
+// doesn't happen, since otherwise the next fetch would misread that
+// stray data byte as an opcode and desync the whole instruction stream.
+//
+// HALT (opcode 0x76) is recognized and handled (the FSM parks in S_HALT
+// and stays there), but since there's no interrupt controller yet,
+// nothing currently wakes it back up -- a known gap for a later phase,
+// not a bug.
 //
 // Memory interface is modeled as combinational read: mem_data_in is
 // expected to reflect memory[mem_addr] within the same cycle. Real block
@@ -17,10 +23,10 @@
 // that change later (Phase 7 integration) without restructuring.
 //
 // Every instruction takes a fixed 4 cycles (FETCH/DECODE/MEM_READ/EXECUTE),
-// even ops that don't strictly need the MEM_READ cycle. Real SM83 timing
-// varies per instruction -- this trades cycle-exact accuracy for a
-// simpler first pass. Worth revisiting once Phase 3's timing-sensitive
-// tests are in play.
+// even ops that don't strictly need the MEM_READ cycle -- LD r8,imm8
+// reuses that same cycle to fetch its immediate byte instead of adding a
+// 5th state. Real SM83 timing varies per instruction; this trades cycle-
+// exact accuracy for a simpler first pass.
 
 module cpu_control (
     input  wire        clk,
@@ -56,19 +62,29 @@ module cpu_control (
     assign halted = (state == S_HALT);
 
     // ---- Decode ----
-    wire [2:0] alu_op    = ir_reg[5:3];  // Block 2: which ALU operation
-    wire [2:0] dest_code = ir_reg[5:3];  // Block 1: destination register (same bits, different meaning)
-    wire [2:0] reg_code  = ir_reg[2:0];  // source/operand register, same field in both blocks
+    // Same 3-bit fields, reused with different meanings depending on which
+    // block the top 2 bits point to -- this is a recurring SM83 pattern,
+    // not something specific to any one of these wires.
+    wire [2:0] alu_op       = ir_reg[5:3];  // Block 2: which ALU operation
+    wire [2:0] dest_code    = ir_reg[5:3];  // Block 1: destination register
+    wire [2:0] ld_imm8_dest = ir_reg[5:3];  // Block 0 LD r,imm8: destination register
+    wire [2:0] reg_code     = ir_reg[2:0];  // source/operand register, shared field
 
+    wire is_block0 = (ir_reg[7:6] == 2'b00);
     wire is_block1 = (ir_reg[7:6] == 2'b01);
     wire is_block2 = (ir_reg[7:6] == 2'b10);
     wire is_halt   = (ir_reg == 8'h76);
 
     wire is_mem_operand = (reg_code  == 3'b110); // source is (HL)
-    wire is_dest_mem     = (dest_code == 3'b110); // destination is (HL) -- LD (HL),r, not yet supported
+    wire is_dest_mem     = (dest_code == 3'b110); // Block 1 dest is (HL) -- LD (HL),r, not supported
+
+    // Block 0's LD r,imm8 pattern is 00 rrr 110 -- same low-3-bits check
+    // as is_mem_operand, just under the Block 0 top bits instead.
+    wire is_ld_imm8            = is_block0 && (reg_code == 3'b110);
+    wire is_ld_imm8_dest_mem   = is_ld_imm8 && (ld_imm8_dest == 3'b110); // LD (HL),d8 -- not supported
+    wire is_supported_ld_imm8  = is_ld_imm8 && !is_ld_imm8_dest_mem;
 
     // Block 1 cases this FSM actually handles: LD r,r' and LD r,(HL).
-    // Excludes HALT (its own state) and LD (HL),r (needs a memory write port).
     wire is_supported_block1 = is_block1 && !is_halt && !is_dest_mem;
 
     wire need_mem_read = (is_block2 || is_block1) && is_mem_operand && !is_halt;
@@ -80,7 +96,8 @@ module cpu_control (
 
     // When the operand is (HL), mem_addr was pointed at hl_pair during
     // MEM_READ, so mem_data_in already reflects that byte here -- no
-    // extra latching register needed.
+    // extra latching register needed. The same reuse works for LD
+    // r,imm8's immediate byte, fetched from pc_reg instead of hl_pair.
     wire [7:0] resolved_b = is_mem_operand ? mem_data_in : reg_b_data;
 
     wire [7:0] alu_result;
@@ -89,19 +106,21 @@ module cpu_control (
     wire do_writeback   = is_block2 && (alu_op != ALU_CP); // CP sets flags only
     wire do_flags_write = is_block2;                        // LD never touches flags
 
-    // write_sel/write_data depend on which block is executing:
-    //   Block 2 always targets A with the ALU result.
-    //   Block 1 targets whatever register the opcode names, with the
-    //   plain source value (resolved_b already handles the (HL) case).
-    wire [2:0] write_sel_mux  = is_block1 ? dest_code : SEL_A;
-    wire [7:0] write_data_mux = is_block1 ? resolved_b : alu_result;
+    // write_sel/write_data depend on which of the three supported cases is
+    // executing. Checked in priority order since they're mutually exclusive
+    // (each is gated on a different top-bits pattern) but written this way
+    // for clarity about what wins if that ever stopped being true.
+    wire [2:0] write_sel_mux  = is_supported_ld_imm8 ? ld_imm8_dest :
+                                is_block1            ? dest_code   : SEL_A;
+    wire [7:0] write_data_mux = is_supported_ld_imm8 ? mem_data_in :
+                                is_block1             ? resolved_b : alu_result;
 
     // MUST be combinational, not registered -- register_file's own
     // posedge-triggered write needs write_en high for the entire cycle
     // the write data is valid (the whole S_EXECUTE state), not a pulse
     // that arrives one edge late relative to when it was computed.
     wire in_execute  = (state == S_EXECUTE);
-    wire rf_write_en = in_execute && (do_writeback || is_supported_block1);
+    wire rf_write_en = in_execute && (do_writeback || is_supported_block1 || is_supported_ld_imm8);
     wire flags_write_en_w = in_execute && do_flags_write;
 
     register_file rf (
@@ -145,16 +164,30 @@ module cpu_control (
                 end
 
                 S_MEM_READ: begin
-                    // ir_reg is valid now (latched at the end of S_DECODE), so
-                    // all the decode wires above are trustworthy this cycle.
+                    // ir_reg is valid now (latched at the end of S_DECODE),
+                    // so all the decode wires above are trustworthy here.
                     if (need_mem_read) begin
                         mem_addr <= hl_pair;
+                    end else if (is_ld_imm8) begin
+                        // Fetch the immediate byte regardless of whether
+                        // this specific variant is supported -- pc_reg was
+                        // already advanced past the opcode, so it's
+                        // currently pointing right at the immediate byte.
+                        mem_addr <= pc_reg;
                     end
                     state <= S_EXECUTE;
                 end
 
                 S_EXECUTE: begin
-                    unimplemented <= !is_block2 && !is_supported_block1 && !is_halt;
+                    if (is_ld_imm8) begin
+                        // Consume the immediate byte from the instruction
+                        // stream even in the unsupported (HL) case -- the
+                        // write doesn't happen, but pc must still skip past
+                        // it, or the next fetch reads stray data as an opcode.
+                        pc_reg <= pc_reg + 1'b1;
+                    end
+                    unimplemented <= !is_block2 && !is_supported_block1 &&
+                                      !is_halt && !is_supported_ld_imm8;
                     state <= is_halt ? S_HALT : S_FETCH;
                 end
 

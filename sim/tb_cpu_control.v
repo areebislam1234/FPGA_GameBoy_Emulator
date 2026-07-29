@@ -1,14 +1,5 @@
 // tb_cpu_control.v
-// Icarus Verilog testbench for cpu_control (Block 2 + Block 1).
-//
-// Provides a flat behavioral memory and runs a short hand-written program
-// through the FSM, checking register A, flags, and `unimplemented` after
-// every instruction -- plus dedicated checks for the LD-into-a-different-
-// register case, the unsupported LD (HL),r case, and HALT.
-//
-// Initial register values are seeded via hierarchical procedural
-// assignment straight into register_file's internal regs, since this FSM
-// can't yet execute LD r,imm8 to set up its own test state.
+// Icarus Verilog testbench for cpu_control (Block 2 + Block 1 + Block 0 LD imm8).
 
 `timescale 1ns/1ps
 
@@ -68,15 +59,21 @@ module tb_cpu_control;
         $dumpfile("cpu_control.vcd");
         $dumpvars(0, tb_cpu_control);
 
-        mem[0] = 8'h81; // ADD A,C
-        mem[1] = 8'h92; // SUB A,D
-        mem[2] = 8'h86; // ADD A,(HL)
-        mem[3] = 8'hBF; // CP A,A
-        mem[4] = 8'h41; // LD B,C
-        mem[5] = 8'h7E; // LD A,(HL)
-        mem[6] = 8'h70; // LD (HL),B  -- unsupported, expect unimplemented=1
-        mem[7] = 8'h76; // HALT
-        mem[8] = 8'h00; // should never actually be fetched
+        mem[0]  = 8'h81; // ADD A,C
+        mem[1]  = 8'h92; // SUB A,D
+        mem[2]  = 8'h86; // ADD A,(HL)
+        mem[3]  = 8'hBF; // CP A,A
+        mem[4]  = 8'h41; // LD B,C
+        mem[5]  = 8'h7E; // LD A,(HL)
+        mem[6]  = 8'h70; // LD (HL),B  -- unsupported
+        mem[7]  = 8'h06; // LD B,d8
+        mem[8]  = 8'h42; //   immediate: 0x42
+        mem[9]  = 8'h3E; // LD A,d8
+        mem[10] = 8'h99; //   immediate: 0x99
+        mem[11] = 8'h36; // LD (HL),d8 -- unsupported, but pc must still skip mem[12]
+        mem[12] = 8'h55; //   immediate (unused -- write is unsupported)
+        mem[13] = 8'h76; // HALT
+        mem[14] = 8'h00; // should never actually be fetched
 
         mem[16'h0100] = 8'h07; // data operand for the (HL) instructions
 
@@ -84,7 +81,6 @@ module tb_cpu_control;
         repeat (3) @(negedge clk);
         rst = 0;
 
-        // Seed initial register state directly (no LD imm8 support yet)
         dut.rf.a_reg = 8'h05;
         dut.rf.c_reg = 8'h03;
         dut.rf.d_reg = 8'h02;
@@ -96,29 +92,49 @@ module tb_cpu_control;
         run_and_check(8'h0D, 0, 0, 0, 0, 1'b0, "ADD A,(HL)");
         run_and_check(8'h0D, 1, 1, 0, 0, 1'b0, "CP A,A");
 
-        // LD B,C: A/flags must be untouched by a plain register move
         run_and_check(8'h0D, 1, 1, 0, 0, 1'b0, "LD B,C (A/flags unchanged)");
         if (dut.rf.b_reg !== 8'h03) begin
             $display("FAIL: LD B,C -- B expected 03 got %02h", dut.rf.b_reg);
             errors = errors + 1;
         end
 
-        // LD A,(HL): A takes the memory byte; flags still untouched (LD never sets them)
         run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "LD A,(HL)");
-
-        // LD (HL),B: unsupported -- nothing should change, unimplemented should fire
         run_and_check(8'h07, 1, 1, 0, 0, 1'b1, "LD (HL),B (unsupported)");
 
-        // HALT: A/flags untouched, NOT flagged unimplemented (it's handled, just parked)
-        run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "HALT");
+        // LD B,d8: B should take the immediate byte; A/flags/unimplemented unaffected
+        run_and_check(8'h07, 1, 1, 0, 0, 1'b0, "LD B,d8");
+        if (dut.rf.b_reg !== 8'h42) begin
+            $display("FAIL: LD B,d8 -- B expected 42 got %02h", dut.rf.b_reg);
+            errors = errors + 1;
+        end
+        if (pc !== 16'd9) begin
+            $display("FAIL: LD B,d8 -- pc expected 9 (skipped opcode+immediate) got %0d", pc);
+            errors = errors + 1;
+        end
+
+        // LD A,d8: A takes the immediate byte directly; flags still untouched
+        run_and_check(8'h99, 1, 1, 0, 0, 1'b0, "LD A,d8");
+        if (pc !== 16'd11) begin
+            $display("FAIL: LD A,d8 -- pc expected 11 got %0d", pc);
+            errors = errors + 1;
+        end
+
+        // LD (HL),d8: unsupported -- A/flags/B unchanged, unimplemented fires,
+        // but pc must still have skipped both the opcode AND its immediate byte
+        run_and_check(8'h99, 1, 1, 0, 0, 1'b1, "LD (HL),d8 (unsupported)");
+        if (pc !== 16'd13) begin
+            $display("FAIL: LD (HL),d8 -- pc expected 13 (must skip immediate even though unsupported) got %0d", pc);
+            errors = errors + 1;
+        end
+
+        // HALT: A/flags untouched, NOT flagged unimplemented
+        run_and_check(8'h99, 1, 1, 0, 0, 1'b0, "HALT");
 
         if (halted !== 1'b1) begin
             $display("FAIL: halted expected 1 got %b", halted);
             errors = errors + 1;
         end
 
-        // Confirm the FSM actually stays parked -- pc must not advance further,
-        // and if it incorrectly fetched mem[8] (0x00), unimplemented would pulse.
         begin : halt_hold_check
             reg [15:0] pc_at_halt;
             pc_at_halt = pc;
