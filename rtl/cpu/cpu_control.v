@@ -1,43 +1,40 @@
 // cpu_control.v
-// SM83 control FSM -- decodes and executes:
+// SM83 control FSM. Supports:
 //   Block 2: ALU A,r8       Block 1: LD r8,r8' (incl. LD (HL),r8)
 //   Block 0: LD r8,imm8 (incl. LD (HL),d8), LD r16,imm16, NOP
-//   Plus unconditional control flow: JR imm8, JP imm16, JP (HL)
+//   Unconditional control flow: JR imm8, JP imm16, JP (HL)
+//   PUSH/POP BC,DE,HL  <-- NEW this round
 //
-// LD r16,imm16 reuses the same "fetch low byte, then high byte" machinery
-// JP imm16 already needed (MEM_READ2), but differs in what happens once
-// both bytes are known:
-//   - LD SP,imm16 writes register_file's dedicated 16-bit SP port in one
-//     shot, same cycle as everything else in EXECUTE.
-//   - LD BC/DE/HL,imm16 is genuinely different: register_file only
-//     exposes ONE 8-bit write port, so loading a pair means TWO separate
-//     writes (high byte, then low byte) across two cycles. That's why
-//     this specific case detours through a new state, S_REG_WRITE_LOW,
-//     after EXECUTE -- the same "add a state when one cycle truly isn't
-//     enough" pattern used earlier for LD (HL),d8 and JP imm16.
+// PUSH AF / POP AF are deliberately NOT supported yet: F (the flags
+// register) has its own dedicated write port in register_file, entirely
+// different from how B/C/D/E/H/L get written, so folding it into this
+// same change would tangle two different write mechanisms together.
+// Flagged as unimplemented, same treatment as conditional jumps.
 //
-// NOP (0x00) is now explicitly recognized rather than falling through to
-// `unimplemented` -- it was incorrectly flagged before since nothing
-// excluded it; a true no-op should read as "handled, does nothing," not
-// "opcode this FSM doesn't understand."
+// PUSH/POP are the most stateful instructions built so far -- each needs
+// TWO sequential memory operations (write high-then-low for PUSH, read
+// low-then-high for POP) at two DIFFERENT addresses, with SP decrementing
+// or incrementing by 1 between each step. That's 4 new states:
+// S_PUSH_HI, S_PUSH_LO, S_POP_LO, S_POP_HI.
 //
-// Conditional jumps are still NOT supported -- deliberately scoped out.
+// PUSH stores high byte at SP-1, low byte at SP-2, finishing with SP
+// decremented by 2 total -- so after a PUSH, SP points at the low byte,
+// matching the little-endian convention used everywhere else in this
+// design. POP reverses this exactly: low byte first (at current SP),
+// then high byte (at SP+1), SP ending incremented by 2.
 //
-// Memory interface: combinational read, synchronous write (see prior
-// history for the full rationale). HALT parks the FSM with no wake-up
-// yet (no interrupt controller).
+// Conditional jumps are still NOT supported. Memory interface:
+// combinational read, synchronous write. HALT parks with no wake-up yet.
 
 module cpu_control (
     input  wire        clk,
     input  wire        rst,
 
-    // Memory interface
     output reg  [15:0] mem_addr,
     input  wire [7:0]  mem_data_in,
     output wire        mem_write_en,
     output wire [7:0]  mem_write_data,
 
-    // Observability
     output wire [15:0] pc,
     output wire [7:0]  ir,
     output reg         unimplemented,
@@ -47,20 +44,26 @@ module cpu_control (
     localparam ALU_CP = 3'b111;
     localparam SEL_A  = 3'b111;
 
-    localparam S_FETCH        = 3'b000,
-               S_DECODE       = 3'b001,
-               S_MEM_READ     = 3'b010,
-               S_MEM_READ2    = 3'b011,
-               S_EXECUTE      = 3'b100,
-               S_MEM_WRITE    = 3'b101,
-               S_HALT         = 3'b110,
-               S_REG_WRITE_LOW = 3'b111;
+    // Now 4 bits wide -- 8 states wasn't enough room once PUSH/POP added
+    // 4 more on top of the existing 8.
+    localparam S_FETCH         = 4'b0000,
+               S_DECODE        = 4'b0001,
+               S_MEM_READ      = 4'b0010,
+               S_MEM_READ2     = 4'b0011,
+               S_EXECUTE       = 4'b0100,
+               S_MEM_WRITE     = 4'b0101,
+               S_HALT          = 4'b0110,
+               S_REG_WRITE_LOW = 4'b0111,
+               S_PUSH_HI       = 4'b1000,
+               S_PUSH_LO       = 4'b1001,
+               S_POP_LO        = 4'b1010,
+               S_POP_HI        = 4'b1011;
 
-    reg [2:0]  state;
+    reg [3:0]  state;
     reg [15:0] pc_reg;
     reg [7:0]  ir_reg;
     reg [7:0]  imm8_reg;
-    reg [7:0]  jp_low_reg; // latches the low byte for JP imm16 AND LD r16,imm16
+    reg [7:0]  jp_low_reg;
 
     assign pc     = pc_reg;
     assign ir     = ir_reg;
@@ -71,7 +74,9 @@ module cpu_control (
     wire [2:0] dest_code    = ir_reg[5:3];
     wire [2:0] ld_imm8_dest = ir_reg[5:3];
     wire [2:0] reg_code     = ir_reg[2:0];
-    wire [1:0] r16_sel      = ir_reg[5:4]; // Block 0 LD r16,imm16: which pair (BC/DE/HL/SP)
+    wire [1:0] r16_sel      = ir_reg[5:4]; // shared by LD r16,imm16 AND PUSH/POP --
+                                             // same bit position, same BC/DE/HL
+                                             // encoding in both instruction tables.
 
     wire is_block0 = (ir_reg[7:6] == 2'b00);
     wire is_block1 = (ir_reg[7:6] == 2'b01);
@@ -83,20 +88,21 @@ module cpu_control (
     wire is_jp_imm16 = (ir_reg == 8'hC3);
     wire is_jp_hl    = (ir_reg == 8'hE9);
 
+    wire is_push = (ir_reg[7:6] == 2'b11) && (ir_reg[3:0] == 4'b0101); // 11 qq 0101
+    wire is_pop  = (ir_reg[7:6] == 2'b11) && (ir_reg[3:0] == 4'b0001); // 11 qq 0001
+    wire is_push_supported = is_push && (r16_sel != 2'b11); // excludes PUSH AF
+    wire is_pop_supported  = is_pop  && (r16_sel != 2'b11); // excludes POP AF
+
     wire is_mem_operand = (reg_code  == 3'b110);
     wire is_dest_mem     = (dest_code == 3'b110);
 
     wire is_ld_imm8          = is_block0 && (reg_code == 3'b110);
     wire is_ld_imm8_dest_mem = is_ld_imm8 && (ld_imm8_dest == 3'b110);
 
-    // LD r16,imm16 pattern: 00 dd 0001
     wire is_ld_r16_imm16      = is_block0 && (ir_reg[3:0] == 4'b0001);
-    wire is_ld_r16_imm16_sp   = is_ld_r16_imm16 && (r16_sel == 2'b11); // SP
-    wire is_ld_r16_imm16_pair = is_ld_r16_imm16 && (r16_sel != 2'b11); // BC/DE/HL
+    wire is_ld_r16_imm16_sp   = is_ld_r16_imm16 && (r16_sel == 2'b11);
+    wire is_ld_r16_imm16_pair = is_ld_r16_imm16 && (r16_sel != 2'b11);
 
-    // dd concatenated with a trailing 0/1 bit gives exactly the matching
-    // 8-bit register codes -- e.g. dd=00 (BC): {00,0}=000=B, {00,1}=001=C.
-    // Same encoding register_file.v already uses, no coincidence.
     wire [2:0] reg16_hi_sel = {r16_sel, 1'b0};
     wire [2:0] reg16_lo_sel = {r16_sel, 1'b1};
 
@@ -116,6 +122,9 @@ module cpu_control (
     wire [7:0]  reg_b_data;
     wire [3:0]  flags_out;
     wire [15:0] hl_pair;
+    wire [15:0] bc_pair;
+    wire [15:0] de_pair;
+    wire [15:0] sp_current;
 
     wire [7:0] resolved_b = is_mem_operand ? mem_data_in : reg_b_data;
 
@@ -127,36 +136,66 @@ module cpu_control (
 
     wire in_execute       = (state == S_EXECUTE);
     wire in_reg_write_low = (state == S_REG_WRITE_LOW);
+    wire in_push_hi = (state == S_PUSH_HI);
+    wire in_push_lo = (state == S_PUSH_LO);
+    wire in_pop_lo  = (state == S_POP_LO);
+    wire in_pop_hi  = (state == S_POP_HI);
 
-    // Register-file write port mux -- priority-ordered since these states
-    // are mutually exclusive (never true at the same time), but written
-    // this way so the priority is explicit rather than assumed.
+    // Which pair PUSH is reading -- r16_sel==2'b10 (HL) is the only
+    // remaining option once is_push_supported has already excluded 2'b11.
+    wire [15:0] push_pair_value = (r16_sel == 2'b00) ? bc_pair :
+                                  (r16_sel == 2'b01) ? de_pair : hl_pair;
+    wire [7:0] push_hi_byte = push_pair_value[15:8];
+    wire [7:0] push_lo_byte = push_pair_value[7:0];
+
+    // Register-file 8-bit write port mux. POP writes low byte first (its
+    // own state), then high byte (its own state) -- opposite order from
+    // LD r16,imm16, which is why these are separate branches rather than
+    // shared with in_reg_write_low even though the underlying reg16_*_sel
+    // wires are reused.
     wire [2:0] write_sel_mux =
-        in_reg_write_low       ? reg16_lo_sel  :
-        is_ld_r16_imm16_pair   ? reg16_hi_sel  :
-        is_ld_imm8_regwrite    ? ld_imm8_dest  :
-        is_block1_regwrite     ? dest_code     : SEL_A;
+        (in_pop_lo || in_reg_write_low) ? reg16_lo_sel :
+        (in_pop_hi || is_ld_r16_imm16_pair) ? reg16_hi_sel :
+        is_ld_imm8_regwrite              ? ld_imm8_dest :
+        is_block1_regwrite               ? dest_code    : SEL_A;
 
     wire [7:0] write_data_mux =
-        in_reg_write_low       ? jp_low_reg  :
-        is_ld_r16_imm16_pair   ? mem_data_in :  // high byte, valid during EXECUTE
-        is_ld_imm8_regwrite    ? mem_data_in :
-        is_block1_regwrite     ? resolved_b  : alu_result;
+        (in_pop_lo || in_pop_hi)   ? mem_data_in :
+        in_reg_write_low            ? jp_low_reg :
+        is_ld_r16_imm16_pair         ? mem_data_in :
+        is_ld_imm8_regwrite           ? mem_data_in :
+        is_block1_regwrite             ? resolved_b : alu_result;
 
     wire rf_write_en =
         (in_execute && (do_writeback || is_block1_regwrite ||
                         is_ld_imm8_regwrite || is_ld_r16_imm16_pair))
-        || in_reg_write_low;
+        || in_reg_write_low || in_pop_lo || in_pop_hi;
 
     wire flags_write_en_w = in_execute && do_flags_write;
 
-    wire sp_write_en_w  = in_execute && is_ld_r16_imm16_sp;
-    wire [15:0] sp_write_data_w = {mem_data_in, jp_low_reg};
+    // SP write port -- three different reasons to write it, unified here.
+    // LD SP,imm16 sets it directly; PUSH/POP each adjust it by 1 per
+    // sub-state (decrementing twice for PUSH, incrementing twice for POP),
+    // using sp_current's value AS OF that specific cycle -- since the
+    // first adjustment's write has already committed by the time the
+    // second sub-state runs, "current minus/plus 1" naturally accumulates
+    // to the correct net -2/+2 without needing to track an original value.
+    wire sp_write_en_w =
+        (in_execute && is_ld_r16_imm16_sp) || in_push_hi || in_push_lo ||
+        in_pop_lo || in_pop_hi;
+
+    wire [15:0] sp_write_data_w =
+        (in_execute && is_ld_r16_imm16_sp) ? {mem_data_in, jp_low_reg} :
+        (in_push_hi || in_push_lo)          ? (sp_current - 16'd1) :
+        (in_pop_lo || in_pop_hi)             ? (sp_current + 16'd1) : 16'h0000;
 
     wire mem_write_en_block1 = in_execute && is_block1_memwrite;
     wire mem_write_en_imm8   = (state == S_MEM_WRITE);
-    assign mem_write_en   = mem_write_en_block1 || mem_write_en_imm8;
-    assign mem_write_data = mem_write_en_imm8 ? imm8_reg : reg_b_data;
+    assign mem_write_en = mem_write_en_block1 || mem_write_en_imm8 ||
+                           in_push_hi || in_push_lo;
+    assign mem_write_data = mem_write_en_imm8 ? imm8_reg :
+                             in_push_hi          ? push_hi_byte :
+                             in_push_lo           ? push_lo_byte : reg_b_data;
 
     register_file rf (
         .clk(clk), .rst(rst),
@@ -166,8 +205,8 @@ module cpu_control (
         .flags_write_en(flags_write_en_w),
         .flags_in({alu_z, alu_n, alu_h, alu_c}),
         .flags_out(flags_out),
-        .sp_write_en(sp_write_en_w), .sp_write_data(sp_write_data_w), .sp(),
-        .bc(), .de(), .hl(hl_pair), .af()
+        .sp_write_en(sp_write_en_w), .sp_write_data(sp_write_data_w), .sp(sp_current),
+        .bc(bc_pair), .de(de_pair), .hl(hl_pair), .af()
     );
 
     alu al (
@@ -210,14 +249,23 @@ module cpu_control (
                     end else if (is_jr) begin
                         mem_addr <= pc_reg;
                     end else if (is_jp_imm16 || is_ld_r16_imm16) begin
-                        mem_addr <= pc_reg; // fetch the low byte
+                        mem_addr <= pc_reg;
+                    end else if (is_push_supported) begin
+                        mem_addr <= sp_current - 16'd1; // high byte's address
+                    end else if (is_pop_supported) begin
+                        mem_addr <= sp_current;          // low byte's address
                     end
-                    state <= (is_jp_imm16 || is_ld_r16_imm16) ? S_MEM_READ2 : S_EXECUTE;
+
+                    if (is_push_supported) begin
+                        state <= S_PUSH_HI;
+                    end else if (is_pop_supported) begin
+                        state <= S_POP_LO;
+                    end else begin
+                        state <= (is_jp_imm16 || is_ld_r16_imm16) ? S_MEM_READ2 : S_EXECUTE;
+                    end
                 end
 
                 S_MEM_READ2: begin
-                    // Shared by JP imm16 and LD r16,imm16 -- both need a
-                    // low byte latched and the high byte's address queued up.
                     jp_low_reg <= mem_data_in;
                     mem_addr   <= pc_reg + 1'b1;
                     pc_reg     <= pc_reg + 1'b1;
@@ -234,9 +282,6 @@ module cpu_control (
                     end else if (is_jp_hl) begin
                         pc_reg <= hl_pair;
                     end else if (is_ld_r16_imm16) begin
-                        // Consume the high byte -- applies to both the SP
-                        // and pair variants, regardless of which write path
-                        // they take next.
                         pc_reg <= pc_reg + 1'b1;
                     end
 
@@ -248,7 +293,8 @@ module cpu_control (
                     unimplemented <= !is_block2 && !is_supported_block1 &&
                                       !is_halt && !is_supported_ld_imm8 &&
                                       !is_jr && !is_jp_imm16 && !is_jp_hl &&
-                                      !is_ld_r16_imm16 && !is_nop;
+                                      !is_ld_r16_imm16 && !is_nop &&
+                                      !is_push_supported && !is_pop_supported;
 
                     if (is_ld_imm8_memwrite) begin
                         state <= S_MEM_WRITE;
@@ -264,10 +310,30 @@ module cpu_control (
                 end
 
                 S_REG_WRITE_LOW: begin
-                    // The write itself happens combinationally (write_sel_mux/
-                    // write_data_mux/rf_write_en, gated on in_reg_write_low) --
-                    // this state just needs to exist for one cycle so that
-                    // write fires, then return to normal fetching.
+                    state <= S_FETCH;
+                end
+
+                S_PUSH_HI: begin
+                    // High byte writes THIS cycle (mem_addr already =
+                    // sp_current(original)-1, set during MEM_READ). Prepare
+                    // the low byte's address for next cycle, using
+                    // sp_current's still-original value here.
+                    mem_addr <= sp_current - 16'd2;
+                    state    <= S_PUSH_LO;
+                end
+
+                S_PUSH_LO: begin
+                    state <= S_FETCH;
+                end
+
+                S_POP_LO: begin
+                    // Low byte writes to the register THIS cycle. Prepare
+                    // the high byte's read address for next cycle.
+                    mem_addr <= sp_current + 16'd1;
+                    state    <= S_POP_HI;
+                end
+
+                S_POP_HI: begin
                     state <= S_FETCH;
                 end
 
