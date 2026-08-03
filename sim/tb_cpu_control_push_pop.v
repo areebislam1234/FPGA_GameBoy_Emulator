@@ -1,11 +1,10 @@
 // tb_cpu_control_push_pop.v
-// Icarus Verilog testbench for cpu_control's PUSH/POP support.
+// Icarus Verilog testbench for cpu_control's PUSH/POP support -- updated
+// for the REGISTERED-read memory timing model.
 //
-// Pushes BC, DE, HL (in that order), then pops them back in REVERSE
-// order (HL, DE, BC) -- standard LIFO stack discipline -- verifying each
-// pair round-trips correctly and SP returns to its original value.
-// Also confirms PUSH AF / POP AF correctly flag unimplemented, since
-// those are deliberately not supported yet.
+// PUSH now takes 6 cycles (no memory reads at all -- just the universal
+// fetch settle). POP now takes 8 cycles (two reads: low byte, high byte,
+// each needing its own settle cycle).
 
 `timescale 1ns/1ps
 
@@ -34,8 +33,9 @@ module tb_cpu_control_push_pop;
         .pc(pc), .ir(ir), .unimplemented(unimplemented), .halted(halted)
     );
 
-    always @(*) begin
-        mem_data_in = mem[mem_addr];
+    // REGISTERED read -- matches real vram.v.
+    always @(posedge clk) begin
+        mem_data_in <= mem[mem_addr];
     end
 
     always @(posedge clk) begin
@@ -46,13 +46,8 @@ module tb_cpu_control_push_pop;
 
     always #5 clk = ~clk;
 
-    // PUSH and POP both take 5 cycles (FETCH/DECODE/MEM_READ/two more).
-    task wait5;
-        begin
-            repeat (5) @(posedge clk);
-            #1;
-        end
-    endtask
+    task wait_push; begin repeat (6) @(posedge clk); #1; end endtask
+    task wait_pop;  begin repeat (8) @(posedge clk); #1; end endtask
 
     task check_unimpl(input exp, input [16*8-1:0] name);
         begin
@@ -81,13 +76,12 @@ module tb_cpu_control_push_pop;
         repeat (3) @(negedge clk);
         rst = 0;
 
-        dut.rf.b_reg  = 8'h11; dut.rf.c_reg = 8'h22; // BC = 0x1122
-        dut.rf.d_reg  = 8'h33; dut.rf.e_reg = 8'h44; // DE = 0x3344
-        dut.rf.h_reg  = 8'h55; dut.rf.l_reg = 8'h66; // HL = 0x5566
+        dut.rf.b_reg  = 8'h11; dut.rf.c_reg = 8'h22;
+        dut.rf.d_reg  = 8'h33; dut.rf.e_reg = 8'h44;
+        dut.rf.h_reg  = 8'h55; dut.rf.l_reg = 8'h66;
         dut.rf.sp_reg = 16'h8000;
 
-        // PUSH BC: expect mem[0x7FFF]=0x11 (hi), mem[0x7FFE]=0x22 (lo), SP=0x7FFE
-        wait5;
+        wait_push;
         if (mem[16'h7FFF] !== 8'h11 || mem[16'h7FFE] !== 8'h22) begin
             $display("FAIL: PUSH BC -- mem[7FFF]=%02h mem[7FFE]=%02h, expected 11/22",
                       mem[16'h7FFF], mem[16'h7FFE]);
@@ -99,8 +93,7 @@ module tb_cpu_control_push_pop;
         end
         check_unimpl(1'b0, "PUSH BC");
 
-        // PUSH DE: mem[0x7FFD]=0x33, mem[0x7FFC]=0x44, SP=0x7FFC
-        wait5;
+        wait_push;
         if (mem[16'h7FFD] !== 8'h33 || mem[16'h7FFC] !== 8'h44) begin
             $display("FAIL: PUSH DE -- mem[7FFD]=%02h mem[7FFC]=%02h, expected 33/44",
                       mem[16'h7FFD], mem[16'h7FFC]);
@@ -111,8 +104,7 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        // PUSH HL: mem[0x7FFB]=0x55, mem[0x7FFA]=0x66, SP=0x7FFA
-        wait5;
+        wait_push;
         if (mem[16'h7FFB] !== 8'h55 || mem[16'h7FFA] !== 8'h66) begin
             $display("FAIL: PUSH HL -- mem[7FFB]=%02h mem[7FFA]=%02h, expected 55/66",
                       mem[16'h7FFB], mem[16'h7FFA]);
@@ -123,15 +115,11 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        // Overwrite the live registers before popping, so a pass only
-        // succeeds if POP genuinely restores values from memory --
-        // not because the registers happened to already hold them.
         dut.rf.b_reg = 8'h00; dut.rf.c_reg = 8'h00;
         dut.rf.d_reg = 8'h00; dut.rf.e_reg = 8'h00;
         dut.rf.h_reg = 8'h00; dut.rf.l_reg = 8'h00;
 
-        // POP HL: should come back as 0x5566 (pushed last, popped first -- LIFO)
-        wait5;
+        wait_pop;
         if (dut.rf.h_reg !== 8'h55 || dut.rf.l_reg !== 8'h66) begin
             $display("FAIL: POP HL -- expected H=55 L=66, got H=%02h L=%02h",
                       dut.rf.h_reg, dut.rf.l_reg);
@@ -143,8 +131,7 @@ module tb_cpu_control_push_pop;
         end
         check_unimpl(1'b0, "POP HL");
 
-        // POP DE: should come back as 0x3344
-        wait5;
+        wait_pop;
         if (dut.rf.d_reg !== 8'h33 || dut.rf.e_reg !== 8'h44) begin
             $display("FAIL: POP DE -- expected D=33 E=44, got D=%02h E=%02h",
                       dut.rf.d_reg, dut.rf.e_reg);
@@ -155,10 +142,7 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        // POP BC: should come back as 0x1122, and SP should be all the way
-        // back to its original 0x8000 -- confirming 3 pushes + 3 pops nets
-        // to zero net stack movement.
-        wait5;
+        wait_pop;
         if (dut.rf.b_reg !== 8'h11 || dut.rf.c_reg !== 8'h22) begin
             $display("FAIL: POP BC -- expected B=11 C=22, got B=%02h C=%02h",
                       dut.rf.b_reg, dut.rf.c_reg);
@@ -169,10 +153,9 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        // PUSH AF / POP AF -- unsupported, 4 cycles each (fall through to
-        // normal EXECUTE rather than the 5-cycle push/pop path), SP must
-        // stay untouched.
-        repeat (4) @(posedge clk);
+        // PUSH AF / POP AF -- unsupported, 5 cycles each now (fall through
+        // to normal EXECUTE with no memory involvement)
+        repeat (5) @(posedge clk);
         #1;
         check_unimpl(1'b1, "PUSH AF (unsupported)");
         if (dut.rf.sp_reg !== 16'h8000) begin
@@ -180,7 +163,7 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        repeat (4) @(posedge clk);
+        repeat (5) @(posedge clk);
         #1;
         check_unimpl(1'b1, "POP AF (unsupported)");
         if (dut.rf.sp_reg !== 16'h8000) begin
@@ -188,8 +171,8 @@ module tb_cpu_control_push_pop;
             errors = errors + 1;
         end
 
-        // HALT
-        repeat (4) @(posedge clk);
+        // HALT: 5 cycles now (was 4)
+        repeat (5) @(posedge clk);
         #1;
         if (halted !== 1'b1) begin
             $display("FAIL: expected halted=1, got %b", halted);

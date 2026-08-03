@@ -1,34 +1,37 @@
 // cpu_control.v
 // SM83 control FSM. Supports:
 //   Block 2: ALU A,r8       Block 1: LD r8,r8' (incl. LD (HL),r8)
-//   Block 0: LD r8,imm8 (incl. LD (HL),d8), LD r16,imm16, NOP,
-//            INC/DEC r8, INC/DEC r16   <-- NEW this round
+//   Block 0: LD r8,imm8 (incl. LD (HL),d8), LD r16,imm16, NOP, INC/DEC r8, INC/DEC r16
 //   Unconditional control flow: JR imm8, JP imm16, JP (HL), CALL imm16, RET
 //   PUSH/POP BC,DE,HL
 //
-// INC/DEC r8 is the first instruction where the ALU operates on a
-// register OTHER than A -- every prior ALU-touching instruction assumed
-// read_sel_a was hardwired to the accumulator. That assumption breaks
-// here, so read_sel_a (and the ALU's op/b inputs) become real muxes.
+// TIMING MODEL CHANGE: this version assumes REGISTERED (synchronous) memory
+// reads, matching real Block RAM (and this project's actual vram.v) --
+// NOT the combinational-read assumption every earlier version used.
 //
-// Real hardware quirk worth documenting: INC/DEC affect Z, N, H but
-// deliberately leave the CARRY flag untouched, even though they reuse
-// the exact same add/subtract-by-1 math as ADD/SUB (which DO set carry).
-// Implemented by reusing alu.v's ADD/SUB ops unchanged (b hardwired to 1),
-// then explicitly re-driving the carry bit with its current value
-// (flags_out[0]) instead of the ALU's freshly computed one.
+// On real hardware, presenting an address does not make data appear that
+// same cycle. A registered-read RAM samples the address at a clock edge
+// and only THEN produces data, valid starting the NEXT cycle. Every
+// earlier version of this file assumed data was available one cycle
+// after setting mem_addr; a genuinely registered memory needs a full
+// EXTRA cycle of the address being stable before the data is valid.
 //
-// INC/DEC r16 (BC/DE/HL/SP) touch NO flags at all. The BC/DE/HL variants
-// reuse the same two-write S_REG_WRITE_LOW mechanism LD r16,imm16 needed,
-// since register_file only has one 8-bit write port. SP's variant is a
-// single write, same as LD SP,imm16.
+// Rather than hand-inserting a uniquely-named wait state at every one of
+// the many places this FSM reads memory, this version adds ONE shared
+// S_MEM_WAIT state plus a next_state register: any transition that needs
+// an extra settling cycle detours through S_MEM_WAIT and re-emerges
+// wherever it was actually headed. Writes are unaffected -- a write
+// commits correctly as long as the address is stable by the write cycle,
+// which the existing one-cycle-ahead address-setting pattern already
+// guarantees; only READS needed this change.
 //
-// INC (HL) / DEC (HL) -- the memory-operand variants -- are NOT yet
-// supported (would need a read-modify-write sequence); flagged
-// unimplemented like other deferred cases.
+// Net effect: every instruction gets +1 cycle for the opcode fetch alone
+// (S_FETCH now always detours through S_MEM_WAIT before S_DECODE can
+// trust mem_data_in), plus +1 more cycle for every additional memory
+// byte an instruction reads. Writes-only instructions (PUSH, LD (HL),r8)
+// only pay the universal +1.
 //
 // Conditional jumps, PUSH AF/POP AF, HALT wake-up remain unsupported.
-// Memory interface: combinational read, synchronous write.
 
 module cpu_control (
     input  wire        clk,
@@ -50,29 +53,32 @@ module cpu_control (
     localparam ALU_CP  = 3'b111;
     localparam SEL_A   = 3'b111;
 
-    localparam S_FETCH          = 4'b0000,
-               S_DECODE         = 4'b0001,
-               S_MEM_READ       = 4'b0010,
-               S_MEM_READ2      = 4'b0011,
-               S_EXECUTE        = 4'b0100,
-               S_MEM_WRITE      = 4'b0101,
-               S_HALT           = 4'b0110,
-               S_REG_WRITE_LOW  = 4'b0111,
-               S_PUSH_HI        = 4'b1000,
-               S_PUSH_LO        = 4'b1001,
-               S_POP_LO         = 4'b1010,
-               S_POP_HI         = 4'b1011,
-               S_CALL_PUSH_HI   = 4'b1100,
-               S_CALL_PUSH_LO   = 4'b1101,
-               S_RET_LO         = 4'b1110,
-               S_RET_HI         = 4'b1111;
+    // 5 bits now -- S_MEM_WAIT is the 17th state, one past what 4 bits
+    // (16 values) could hold.
+    localparam S_FETCH          = 5'b00000,
+               S_DECODE         = 5'b00001,
+               S_MEM_READ       = 5'b00010,
+               S_MEM_READ2      = 5'b00011,
+               S_EXECUTE        = 5'b00100,
+               S_MEM_WRITE      = 5'b00101,
+               S_HALT           = 5'b00110,
+               S_REG_WRITE_LOW  = 5'b00111,
+               S_PUSH_HI        = 5'b01000,
+               S_PUSH_LO        = 5'b01001,
+               S_POP_LO         = 5'b01010,
+               S_POP_HI         = 5'b01011,
+               S_CALL_PUSH_HI   = 5'b01100,
+               S_CALL_PUSH_LO   = 5'b01101,
+               S_RET_LO         = 5'b01110,
+               S_RET_HI         = 5'b01111,
+               S_MEM_WAIT       = 5'b10000;
 
-    reg [3:0]  state;
+    reg [4:0]  state;
+    reg [4:0]  next_state; // where S_MEM_WAIT should go once the extra settling cycle passes
     reg [15:0] pc_reg;
     reg [7:0]  ir_reg;
     reg [7:0]  imm8_reg;
-    reg [7:0]  jp_low_reg;       // shared low-byte latch: JP imm16, LD r16,imm16,
-                                   // RET, AND now INC/DEC r16's low-byte writeback
+    reg [7:0]  jp_low_reg;
     reg [15:0] call_target_reg;
 
     assign pc     = pc_reg;
@@ -83,7 +89,7 @@ module cpu_control (
     wire [2:0] alu_op       = ir_reg[5:3];
     wire [2:0] dest_code    = ir_reg[5:3];
     wire [2:0] ld_imm8_dest = ir_reg[5:3];
-    wire [2:0] incdec_r8_sel = ir_reg[5:3]; // same field, INC/DEC r8's target register
+    wire [2:0] incdec_r8_sel = ir_reg[5:3];
     wire [2:0] reg_code     = ir_reg[2:0];
     wire [1:0] r16_sel      = ir_reg[5:4];
 
@@ -104,13 +110,11 @@ module cpu_control (
     wire is_push_supported = is_push && (r16_sel != 2'b11);
     wire is_pop_supported  = is_pop  && (r16_sel != 2'b11);
 
-    // INC/DEC r8: pattern 00 rrr 100 / 00 rrr 101
     wire is_inc_r8 = is_block0 && (ir_reg[2:0] == 3'b100);
     wire is_dec_r8 = is_block0 && (ir_reg[2:0] == 3'b101);
-    wire is_inc_r8_regwrite = is_inc_r8 && (incdec_r8_sel != 3'b110); // excludes INC (HL)
-    wire is_dec_r8_regwrite = is_dec_r8 && (incdec_r8_sel != 3'b110); // excludes DEC (HL)
+    wire is_inc_r8_regwrite = is_inc_r8 && (incdec_r8_sel != 3'b110);
+    wire is_dec_r8_regwrite = is_dec_r8 && (incdec_r8_sel != 3'b110);
 
-    // INC/DEC r16: pattern 00 dd 0011 / 00 dd 1011
     wire is_inc_r16 = is_block0 && (ir_reg[3:0] == 4'b0011);
     wire is_dec_r16 = is_block0 && (ir_reg[3:0] == 4'b1011);
     wire is_inc_dec_r16_sp   = (is_inc_r16 || is_dec_r16) && (r16_sel == 2'b11);
@@ -139,6 +143,11 @@ module cpu_control (
 
     wire need_mem_read = (is_block2 || is_block1) && is_mem_operand && !is_halt;
 
+    // Does the READ leg of MEM_READ->EXECUTE need a settle cycle?
+    // (is_block1_memwrite and the "nothing memory-related" case do NOT --
+    // one's a write, the other never touches memory at all.)
+    wire mem_read_before_execute = need_mem_read || is_ld_imm8 || is_jr;
+
     wire [15:0] jr_offset_ext = {{8{mem_data_in[7]}}, mem_data_in};
 
     wire [7:0]  reg_a_data;
@@ -151,8 +160,6 @@ module cpu_control (
 
     wire [7:0] resolved_b = is_mem_operand ? mem_data_in : reg_b_data;
 
-    // ---- ALU input muxes -- INC/DEC r8 is the first case where these
-    // aren't simply "A" and "the decoded operand register" ----
     wire [2:0] read_sel_a_mux = (is_inc_r8_regwrite || is_dec_r8_regwrite) ?
                                  incdec_r8_sel : SEL_A;
     wire [2:0] alu_op_mux = is_inc_r8_regwrite ? ALU_ADD :
@@ -163,17 +170,12 @@ module cpu_control (
     wire [7:0] alu_result;
     wire       alu_z, alu_n, alu_h, alu_c;
 
-    // Carry preservation: INC/DEC must NOT change C, even though they
-    // reuse ADD/SUB's math (which normally does set C).
     wire preserve_carry = is_inc_r8_regwrite || is_dec_r8_regwrite;
     wire flags_carry_bit = preserve_carry ? flags_out[0] : alu_c;
 
     wire do_writeback   = is_block2 && (alu_op != ALU_CP);
     wire do_flags_write = is_block2 || is_inc_r8_regwrite || is_dec_r8_regwrite;
-    // 16-bit INC/DEC touches NO flags -- deliberately absent from do_flags_write.
 
-    // 16-bit pair INC/DEC -- computed directly, not through the ALU
-    // (ALU is 8-bit only; this is plain 16-bit +1/-1 with natural wraparound)
     wire [15:0] incdec_pair_value = (r16_sel == 2'b00) ? bc_pair :
                                     (r16_sel == 2'b01) ? de_pair : hl_pair;
     wire [15:0] incdec_pair_result = is_inc_r16 ? (incdec_pair_value + 16'd1) :
@@ -209,7 +211,7 @@ module cpu_control (
         is_ld_r16_imm16_pair          ? mem_data_in :
         (is_inc_r8_regwrite || is_dec_r8_regwrite) ? alu_result :
         is_ld_imm8_regwrite            ? mem_data_in :
-        is_block1_regwrite              ? resolved_b : alu_result;
+        is_block1_regwrite               ? resolved_b : alu_result;
 
     wire rf_write_en =
         (in_execute && (do_writeback || is_block1_regwrite ||
@@ -263,6 +265,7 @@ module cpu_control (
     always @(posedge clk) begin
         if (rst) begin
             state           <= S_FETCH;
+            next_state      <= S_FETCH;
             pc_reg          <= 16'h0000;
             ir_reg          <= 8'h00;
             mem_addr        <= 16'h0000;
@@ -275,12 +278,20 @@ module cpu_control (
 
             case (state)
                 S_FETCH: begin
-                    mem_addr <= pc_reg;
-                    state    <= S_DECODE;
+                    mem_addr   <= pc_reg;
+                    next_state <= S_DECODE; // opcode fetch always needs the settle cycle
+                    state      <= S_MEM_WAIT;
+                end
+
+                S_MEM_WAIT: begin
+                    // Pure delay -- mem_addr stays whatever it already
+                    // was, giving memory a full cycle to settle before
+                    // next_state trusts mem_data_in.
+                    state <= next_state;
                 end
 
                 S_DECODE: begin
-                    ir_reg <= mem_data_in;
+                    ir_reg <= mem_data_in; // now genuinely settled
                     pc_reg <= pc_reg + 1'b1;
                     state  <= S_MEM_READ;
                 end
@@ -305,21 +316,32 @@ module cpu_control (
                     end
 
                     if (is_push_supported) begin
-                        state <= S_PUSH_HI;
+                        state <= S_PUSH_HI; // write-only, no settle needed
                     end else if (is_pop_supported) begin
-                        state <= S_POP_LO;
+                        next_state <= S_POP_LO; // reads -- needs settle
+                        state      <= S_MEM_WAIT;
                     end else if (is_ret) begin
-                        state <= S_RET_LO;
+                        next_state <= S_RET_LO; // reads -- needs settle
+                        state      <= S_MEM_WAIT;
+                    end else if (is_jp_imm16 || is_ld_r16_imm16 || is_call) begin
+                        next_state <= S_MEM_READ2; // reads low byte -- needs settle
+                        state      <= S_MEM_WAIT;
+                    end else if (is_block1_memwrite) begin
+                        state <= S_EXECUTE; // write-only, no settle needed
+                    end else if (mem_read_before_execute) begin
+                        next_state <= S_EXECUTE; // reads operand -- needs settle
+                        state      <= S_MEM_WAIT;
                     end else begin
-                        state <= (is_jp_imm16 || is_ld_r16_imm16 || is_call) ? S_MEM_READ2 : S_EXECUTE;
+                        state <= S_EXECUTE; // no memory involved at all
                     end
                 end
 
                 S_MEM_READ2: begin
-                    jp_low_reg <= mem_data_in;
+                    jp_low_reg <= mem_data_in; // settled low byte
                     mem_addr   <= pc_reg + 1'b1;
                     pc_reg     <= pc_reg + 1'b1;
-                    state      <= S_EXECUTE;
+                    next_state <= S_EXECUTE; // reads high byte -- needs settle
+                    state      <= S_MEM_WAIT;
                 end
 
                 S_EXECUTE: begin
@@ -345,9 +367,6 @@ module cpu_control (
                     end
 
                     if (is_inc_dec_r16_pair) begin
-                        // High byte writes via the normal write port this
-                        // cycle; low byte gets latched here for
-                        // S_REG_WRITE_LOW to write next cycle.
                         jp_low_reg <= incdec_pair_result[7:0];
                     end
 
@@ -361,11 +380,11 @@ module cpu_control (
                                       !is_inc_dec_r16_pair && !is_inc_dec_r16_sp;
 
                     if (is_ld_imm8_memwrite) begin
-                        state <= S_MEM_WRITE;
+                        state <= S_MEM_WRITE; // write-only, no settle needed
                     end else if (is_ld_r16_imm16_pair || is_inc_dec_r16_pair) begin
-                        state <= S_REG_WRITE_LOW;
+                        state <= S_REG_WRITE_LOW; // writes an already-known byte
                     end else if (is_call) begin
-                        state <= S_CALL_PUSH_HI;
+                        state <= S_CALL_PUSH_HI; // write-only, no settle needed
                     end else begin
                         state <= is_halt ? S_HALT : S_FETCH;
                     end
@@ -389,8 +408,11 @@ module cpu_control (
                 end
 
                 S_POP_LO: begin
-                    mem_addr <= sp_current + 16'd1;
-                    state    <= S_POP_HI;
+                    // Low byte writes to the register this cycle (mem_data_in
+                    // is now settled, thanks to the wait before this state).
+                    mem_addr   <= sp_current + 16'd1;
+                    next_state <= S_POP_HI; // reads high byte -- needs settle
+                    state      <= S_MEM_WAIT;
                 end
 
                 S_POP_HI: begin
@@ -408,13 +430,14 @@ module cpu_control (
                 end
 
                 S_RET_LO: begin
-                    jp_low_reg <= mem_data_in;
+                    jp_low_reg <= mem_data_in; // settled low byte
                     mem_addr   <= sp_current + 16'd1;
-                    state      <= S_RET_HI;
+                    next_state <= S_RET_HI; // reads high byte -- needs settle
+                    state      <= S_MEM_WAIT;
                 end
 
                 S_RET_HI: begin
-                    pc_reg <= {mem_data_in, jp_low_reg};
+                    pc_reg <= {mem_data_in, jp_low_reg}; // settled high byte
                     state  <= S_FETCH;
                 end
 

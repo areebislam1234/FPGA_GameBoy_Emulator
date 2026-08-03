@@ -1,20 +1,18 @@
-// tb_cpu_control.v
-// Icarus Verilog testbench for cpu_control, focused on the new jump support
-// (JR, JP imm16, JP (HL)). Each jump type gets its own isolated
-// reset-and-run phase with a small, deliberately loop-free program --
-// combining all of them into one continuous address space turned out to
-// risk accidental infinite loops (a backward jump's landing zone falling
-// through right back into the jump that caused it), so a clean reset
-// between phases sidesteps that entirely.
+// tb_cpu_control_jumps.v
+// Icarus Verilog testbench for cpu_control's jump support (JR, JP imm16,
+// JP (HL)) -- updated for the REGISTERED-read memory timing model.
 //
-// Regression coverage for Blocks 0/1/2 and memory writes already lives in
-// the existing tb_cpu_control.v history (register file / ALU / LD /
-// memory-write tests) -- this file focuses specifically on control flow,
-// since none of that existing decode logic was touched by this change.
+// This file already used generous fixed cycle budgets per phase rather
+// than precise per-instruction counts, so the update here is simpler
+// than the primary regression file: switch the memory model to
+// registered (matching real vram.v), and enlarge the budget to
+// comfortably cover the new, longer per-instruction cycle counts.
+// Worst-case phase (JP imm16, two reads, + landing LD + HALT) now needs
+// roughly 19 cycles -- a budget of 50 leaves generous headroom.
 
 `timescale 1ns/1ps
 
-module tb_cpu_control;
+module tb_cpu_control_jumps;
 
     reg clk = 0;
     reg rst = 1;
@@ -39,8 +37,9 @@ module tb_cpu_control;
         .pc(pc), .ir(ir), .unimplemented(unimplemented), .halted(halted)
     );
 
-    always @(*) begin
-        mem_data_in = mem[mem_addr];
+    // REGISTERED read -- matches real vram.v.
+    always @(posedge clk) begin
+        mem_data_in <= mem[mem_addr];
     end
 
     always @(posedge clk) begin
@@ -51,18 +50,13 @@ module tb_cpu_control;
 
     always #5 clk = ~clk;
 
-    // Clears memory, pulses reset, waits for the program (which must end
-    // in HALT) to finish, then checks A and unimplemented.
     task run_phase(input [16*8-1:0] name, input [7:0] exp_a, input exp_unimpl);
         begin
             rst = 1;
             repeat (3) @(negedge clk);
             rst = 0;
 
-            // Generous cycle budget -- these programs are short (a jump,
-            // one landing instruction, HALT), so this comfortably covers
-            // even the 5-cycle JP imm16 path with room to spare.
-            repeat (30) @(posedge clk);
+            repeat (50) @(posedge clk);
             #1;
 
             if (dut.rf.a_reg !== exp_a) begin
@@ -82,54 +76,40 @@ module tb_cpu_control;
     endtask
 
     initial begin
-        $dumpfile("cpu_control.vcd");
-        $dumpvars(0, tb_cpu_control);
+        $dumpfile("cpu_control_jumps.vcd");
+        $dumpvars(0, tb_cpu_control_jumps);
 
-        // ---- Phase 1: JR forward (+offset) ----
-        // JR +3 skips over a "poison" LD A,d8=0xFF that should never
-        // execute; landing zone sets A=0x11 to confirm the jump worked.
-        mem[0] = 8'h18; mem[1] = 8'h03;           // JR +3 -> target = 2+3 = 5
-        mem[2] = 8'h3E; mem[3] = 8'hFF;           // poison LD A,d8 (skipped)
-        mem[4] = 8'h00;                            // padding
-        mem[5] = 8'h3E; mem[6] = 8'h11;           // landing zone: LD A,d8=0x11
-        mem[7] = 8'h76;                            // HALT
+        mem[0] = 8'h18; mem[1] = 8'h03;
+        mem[2] = 8'h3E; mem[3] = 8'hFF;
+        mem[4] = 8'h00;
+        mem[5] = 8'h3E; mem[6] = 8'h11;
+        mem[7] = 8'h76;
         run_phase("JR forward", 8'h11, 1'b0);
 
-        // ---- Phase 2: JR backward (-offset) ----
-        // A lead-in JR jumps forward to address 10 (skipping the real
-        // backward-landing zone at address 3, keeping it untouched on the
-        // first pass). From address 10, a second JR with a negative
-        // offset jumps BACK to address 3, which immediately halts after
-        // setting A -- preventing any risk of looping back through either JR.
-        mem[0]  = 8'h18; mem[1] = 8'h08;          // JR +8 -> target = 2+8 = 10 (lead-in)
-        mem[2]  = 8'h00;                           // padding (skipped)
-        mem[3]  = 8'h3E; mem[4] = 8'h22;          // backward-landing zone: LD A,d8=0x22
-        mem[5]  = 8'h76;                           // HALT -- stops here, no fallthrough risk
-        mem[6]  = 8'h00; mem[7] = 8'h00; mem[8] = 8'h00; mem[9] = 8'h00; // padding
-        mem[10] = 8'h18; mem[11] = 8'hF7;          // JR -9 -> target = 12-9 = 3
+        mem[0]  = 8'h18; mem[1] = 8'h08;
+        mem[2]  = 8'h00;
+        mem[3]  = 8'h3E; mem[4] = 8'h22;
+        mem[5]  = 8'h76;
+        mem[6]  = 8'h00; mem[7] = 8'h00; mem[8] = 8'h00; mem[9] = 8'h00;
+        mem[10] = 8'h18; mem[11] = 8'hF7;
         run_phase("JR backward", 8'h22, 1'b0);
 
-        // ---- Phase 3: JP imm16 (absolute) ----
-        mem[0] = 8'hC3; mem[1] = 8'h20; mem[2] = 8'h00; // JP 0x0020
-        mem[16'h0020] = 8'h3E; mem[16'h0021] = 8'h33;    // landing zone: LD A,d8=0x33
-        mem[16'h0022] = 8'h76;                            // HALT
+        mem[0] = 8'hC3; mem[1] = 8'h20; mem[2] = 8'h00;
+        mem[16'h0020] = 8'h3E; mem[16'h0021] = 8'h33;
+        mem[16'h0022] = 8'h76;
         run_phase("JP imm16", 8'h33, 1'b0);
 
-        // ---- Phase 4: JP (HL) ----
-        mem[0] = 8'hE9;                                    // JP (HL)
-        mem[16'h0040] = 8'h3E; mem[16'h0041] = 8'h44;      // landing zone: LD A,d8=0x44
-        mem[16'h0042] = 8'h76;                              // HALT
+        mem[0] = 8'hE9;
+        mem[16'h0040] = 8'h3E; mem[16'h0041] = 8'h44;
+        mem[16'h0042] = 8'h76;
 
         rst = 1;
         repeat (3) @(negedge clk);
         rst = 0;
-        // Preset H:L to point at the landing zone -- same hierarchical
-        // technique used throughout this project, since LD r16,imm16
-        // isn't built yet.
         dut.rf.h_reg = 8'h00;
         dut.rf.l_reg = 8'h40;
 
-        repeat (30) @(posedge clk);
+        repeat (50) @(posedge clk);
         #1;
         if (dut.rf.a_reg !== 8'h44) begin
             $display("FAIL: JP (HL) -- A expected 44 got %02h", dut.rf.a_reg);

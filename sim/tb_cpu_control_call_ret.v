@@ -1,12 +1,10 @@
 // tb_cpu_control_call_ret.v
-// Icarus Verilog testbench for cpu_control's CALL/RET support.
+// Icarus Verilog testbench for cpu_control's CALL/RET support -- updated
+// for the REGISTERED-read memory timing model.
 //
-// The real test here isn't CALL or RET in isolation -- it's a full
-// round trip: CALL jumps into a subroutine, the subroutine runs and sets
-// a distinguishing register value, RET returns, and execution correctly
-// resumes at the instruction right after the original CALL (not before
-// it, not somewhere else) -- proving the return address was computed,
-// pushed, and popped correctly.
+// CALL now takes 10 cycles (2 reads for the target address, 2 writes for
+// the pushed return address, plus the universal fetch settle). RET now
+// takes 8 cycles (2 reads for the popped return address).
 
 `timescale 1ns/1ps
 
@@ -35,8 +33,9 @@ module tb_cpu_control_call_ret;
         .pc(pc), .ir(ir), .unimplemented(unimplemented), .halted(halted)
     );
 
-    always @(*) begin
-        mem_data_in = mem[mem_addr];
+    // REGISTERED read -- matches real vram.v.
+    always @(posedge clk) begin
+        mem_data_in <= mem[mem_addr];
     end
 
     always @(posedge clk) begin
@@ -51,24 +50,22 @@ module tb_cpu_control_call_ret;
         $dumpfile("cpu_control_call_ret.vcd");
         $dumpvars(0, tb_cpu_control_call_ret);
 
-        // Main program
         mem[0] = 8'hCD; mem[1] = 8'h10; mem[2] = 8'h00; // CALL 0x0010
-        mem[3] = 8'h3E; mem[4] = 8'h99;                  // LD A,d8=0x99 (runs only if RET lands exactly here)
+        mem[3] = 8'h3E; mem[4] = 8'h99;                  // LD A,d8=0x99
         mem[5] = 8'h76;                                   // HALT
 
-        // Subroutine at 0x0010
-        mem[16'h0010] = 8'h06; mem[16'h0011] = 8'h42;     // LD B,d8=0x42 (confirms we entered)
+        mem[16'h0010] = 8'h06; mem[16'h0011] = 8'h42;     // LD B,d8=0x42
         mem[16'h0012] = 8'hC9;                             // RET
 
         rst = 1;
         repeat (3) @(negedge clk);
         rst = 0;
 
-        dut.rf.sp_reg = 16'h8000; // preset SP, well clear of any real data
+        dut.rf.sp_reg = 16'h8000;
 
-        // CALL takes 7 cycles (FETCH/DECODE/MEM_READ/MEM_READ2/EXECUTE/
-        // CALL_PUSH_HI/CALL_PUSH_LO)
-        repeat (7) @(posedge clk);
+        // CALL: 10 cycles now (was 7) -- two reads for the target, two
+        // writes for the pushed return address
+        repeat (10) @(posedge clk);
         #1;
         if (pc !== 16'h0010) begin
             $display("FAIL: after CALL -- pc expected 0010 got %04h", pc);
@@ -88,16 +85,16 @@ module tb_cpu_control_call_ret;
             errors = errors + 1;
         end
 
-        // LD B,d8 inside the subroutine -- 4 cycles
-        repeat (4) @(posedge clk);
+        // LD B,d8 inside the subroutine -- 6 cycles now (was 4)
+        repeat (6) @(posedge clk);
         #1;
         if (dut.rf.b_reg !== 8'h42) begin
             $display("FAIL: subroutine LD B,d8 -- B expected 42 got %02h", dut.rf.b_reg);
             errors = errors + 1;
         end
 
-        // RET -- 5 cycles (FETCH/DECODE/MEM_READ/RET_LO/RET_HI)
-        repeat (5) @(posedge clk);
+        // RET -- 8 cycles now (was 5)
+        repeat (8) @(posedge clk);
         #1;
         if (pc !== 16'h0003) begin
             $display("FAIL: after RET -- pc expected 0003 (right after the CALL) got %04h", pc);
@@ -108,8 +105,8 @@ module tb_cpu_control_call_ret;
             errors = errors + 1;
         end
 
-        // LD A,d8 -- only executes correctly if RET truly landed at 0x0003
-        repeat (4) @(posedge clk);
+        // LD A,d8 -- 6 cycles now (was 4)
+        repeat (6) @(posedge clk);
         #1;
         if (dut.rf.a_reg !== 8'h99) begin
             $display("FAIL: post-RET LD A,d8 -- A expected 99 got %02h (execution did not resume correctly)",
@@ -117,8 +114,8 @@ module tb_cpu_control_call_ret;
             errors = errors + 1;
         end
 
-        // HALT
-        repeat (4) @(posedge clk);
+        // HALT -- 5 cycles now (was 4)
+        repeat (5) @(posedge clk);
         #1;
         if (halted !== 1'b1) begin
             $display("FAIL: expected halted=1, got %b", halted);

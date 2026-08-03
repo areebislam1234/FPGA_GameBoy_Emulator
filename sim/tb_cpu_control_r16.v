@@ -1,10 +1,7 @@
 // tb_cpu_control_r16.v
 // Icarus Verilog testbench for cpu_control's LD r16,imm16 support (all
-// four variants) plus confirming NOP no longer triggers `unimplemented`.
-//
-// Regression coverage for everything else (ALU/LD r8/memory writes in
-// tb_cpu_control.v, jumps in tb_cpu_control_jumps.v) is unchanged and
-// covered separately -- this file is scoped to what's new this round.
+// four variants) plus NOP -- updated for the REGISTERED-read memory
+// timing model.
 
 `timescale 1ns/1ps
 
@@ -33,8 +30,9 @@ module tb_cpu_control_r16;
         .pc(pc), .ir(ir), .unimplemented(unimplemented), .halted(halted)
     );
 
-    always @(*) begin
-        mem_data_in = mem[mem_addr];
+    // REGISTERED read -- matches real vram.v.
+    always @(posedge clk) begin
+        mem_data_in <= mem[mem_addr];
     end
 
     always @(posedge clk) begin
@@ -45,11 +43,12 @@ module tb_cpu_control_r16;
 
     always #5 clk = ~clk;
 
-    // LD BC/DE/HL,imm16 takes 6 cycles (FETCH/DECODE/MEM_READ/MEM_READ2/
-    // EXECUTE/REG_WRITE_LOW). Checks unimplemented right after.
+    // LD BC/DE/HL,imm16 now takes 9 cycles: FETCH/WAIT/DECODE/MEM_READ/
+    // WAIT/MEM_READ2/WAIT/EXECUTE/REG_WRITE_LOW -- two extra settle
+    // cycles (low byte, high byte) plus the universal fetch settle.
     task check_pair_load(input [7:0] exp_hi, input [7:0] exp_lo, input [16*8-1:0] name);
         begin
-            repeat (6) @(posedge clk);
+            repeat (9) @(posedge clk);
             #1;
             if (unimplemented !== 1'b0) begin
                 $display("FAIL: %0s -- unimplemented expected 0 got %b", name, unimplemented);
@@ -94,8 +93,8 @@ module tb_cpu_control_r16;
             errors = errors + 1;
         end
 
-        // LD SP,imm16 takes only 5 cycles (no REG_WRITE_LOW -- single write)
-        repeat (5) @(posedge clk);
+        // LD SP,imm16: 8 cycles (two reads, but no REG_WRITE_LOW -- single write)
+        repeat (8) @(posedge clk);
         #1;
         if (unimplemented !== 1'b0) begin
             $display("FAIL: LD SP,imm16 -- unimplemented expected 0 got %b", unimplemented);
@@ -106,8 +105,6 @@ module tb_cpu_control_r16;
             errors = errors + 1;
         end
 
-        // Confirm B/C/D/E/H/L survived all three pair loads without
-        // cross-contamination (e.g. LD HL,imm16 wrongly touching DE)
         if (dut.rf.b_reg !== 8'h12 || dut.rf.c_reg !== 8'h34 ||
             dut.rf.d_reg !== 8'h56 || dut.rf.e_reg !== 8'h78 ||
             dut.rf.h_reg !== 8'h9A || dut.rf.l_reg !== 8'hBC) begin
@@ -115,16 +112,16 @@ module tb_cpu_control_r16;
             errors = errors + 1;
         end
 
-        // NOP: 4 cycles, must NOT trigger unimplemented
-        repeat (4) @(posedge clk);
+        // NOP: 5 cycles now (was 4) -- just the universal fetch settle
+        repeat (5) @(posedge clk);
         #1;
         if (unimplemented !== 1'b0) begin
             $display("FAIL: NOP -- unimplemented expected 0 got %b (NOP bug not fixed)", unimplemented);
             errors = errors + 1;
         end
 
-        // HALT
-        repeat (4) @(posedge clk);
+        // HALT: 5 cycles now (was 4)
+        repeat (5) @(posedge clk);
         #1;
         if (halted !== 1'b1) begin
             $display("FAIL: expected halted=1 after HALT, got %b", halted);
